@@ -1,0 +1,8 @@
+fastapi==0.112.2
+uvicorn==0.30.6
+openai==1.47.0
+pydantic==2.8.2
+sqlalchemy==2.0.34
+psycopg2-binary==2.9.9
+azure-ai-documentintelligence==1.0.0b3
+azure-core==1.30.2
