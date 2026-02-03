@@ -102,6 +102,13 @@ Schema:
 ## 5) Backend MVP (FastAPI)
 File: `backend/main.py`
 
+### Enhancements in this implementation
+- **Persistent processing cache** stored on disk (`CACHE_DIR`) so results survive restarts.
+- **Upload guardrails** with a configurable size limit (`MAX_UPLOAD_MB`) and input validation.
+- **Data normalization** for totals reconciliation, line ordering, and non-negative enforcement.
+- **Health endpoint** for operational readiness checks.
+- **Document retrieval endpoint** for troubleshooting and downstream integrations.
+
 ### Run
 ```bash
 cd backend
@@ -119,12 +126,17 @@ OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o-mini
 DATABASE_URL=postgresql+psycopg2://app:app@localhost:5432/analytics
 UPLOAD_DIR=./uploads
+CACHE_DIR=./cache
+MAX_UPLOAD_MB=15
+LOG_LEVEL=INFO
 ```
 
 ### Endpoints
 - `POST /upload-document` → Stores file locally and returns `document_id`.
-- `POST /process-document` → Runs Form Recognizer, calls OpenAI, validates strict JSON.
+- `POST /process-document` → Runs Form Recognizer, calls OpenAI, validates strict JSON (supports `force: true`).
 - `POST /load-analytics` → Loads validated data into SQL.
+- `GET /documents/{document_id}` → Returns cached processed output.
+- `GET /health` → Basic readiness signal for integrations/monitoring.
 
 ## 6) Power BI Embedding
 

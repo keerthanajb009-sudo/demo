@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import date, datetime
@@ -18,6 +19,9 @@ from azure.core.credentials import AzureKeyCredential
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "./cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "15"))
 
 AZURE_DOC_INTEL_ENDPOINT = os.getenv("AZURE_DOC_INTEL_ENDPOINT", "")
 AZURE_DOC_INTEL_KEY = os.getenv("AZURE_DOC_INTEL_KEY", "")
@@ -27,6 +31,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://app:app@localhos
 
 app = FastAPI(title="AI Data Translation MVP")
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("ai-data-translation")
+
 
 class InvoiceLine(BaseModel):
     line_number: int
@@ -34,6 +44,13 @@ class InvoiceLine(BaseModel):
     quantity: float
     unit_price: float
     line_amount: float
+
+    @field_validator("quantity", "unit_price", "line_amount")
+    @classmethod
+    def validate_non_negative(cls, value: float, info: Any) -> float:
+        if value < 0:
+            raise ValueError(f"{info.field_name} cannot be negative")
+        return value
 
 
 class InvoicePayload(BaseModel):
@@ -56,9 +73,50 @@ class InvoicePayload(BaseModel):
             raise ValueError("currency_code must be ISO 4217")
         return value.upper()
 
+    @field_validator("lines")
+    @classmethod
+    def validate_unique_lines(cls, lines: list[InvoiceLine]) -> list[InvoiceLine]:
+        line_numbers = [line.line_number for line in lines]
+        if len(line_numbers) != len(set(line_numbers)):
+            raise ValueError("line_number values must be unique")
+        return lines
+
+    @field_validator("subtotal_amount", "tax_amount", "total_amount")
+    @classmethod
+    def validate_amounts(cls, value: float, info: Any) -> float:
+        if value < 0:
+            raise ValueError(f"{info.field_name} cannot be negative")
+        return value
+
+    @field_validator("lines")
+    @classmethod
+    def normalize_line_order(cls, lines: list[InvoiceLine]) -> list[InvoiceLine]:
+        return sorted(lines, key=lambda line: line.line_number)
+
+    @field_validator("invoice_id", "vendor_id", "vendor_name")
+    @classmethod
+    def normalize_strings(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("identifier fields cannot be blank")
+        return value.strip()
+
+    @classmethod
+    def _reconcile_tax(cls, subtotal: float, tax: float, total: float) -> float:
+        if abs((subtotal + tax) - total) > 0.01:
+            return total - subtotal
+        return tax
+
+    def reconcile_totals(self) -> None:
+        object.__setattr__(
+            self,
+            "tax_amount",
+            self._reconcile_tax(self.subtotal_amount, self.tax_amount, self.total_amount),
+        )
+
 
 class ProcessRequest(BaseModel):
     document_id: str
+    force: bool = False
 
 
 class LoadRequest(BaseModel):
@@ -127,22 +185,78 @@ Schema:
 """.strip()
 
 
+def cache_path(document_id: str) -> Path:
+    return CACHE_DIR / f"{document_id}.json"
+
+
+def read_cache(document_id: str) -> ProcessResult | None:
+    if document_id in CACHE:
+        return CACHE[document_id]
+    path = cache_path(document_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        cached = ProcessResult.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning("Cache read failed for %s: %s", document_id, exc)
+        return None
+    CACHE[document_id] = cached
+    return cached
+
+
+def write_cache(result_payload: ProcessResult) -> None:
+    payload = result_payload.model_dump(mode="json")
+    cache_path(result_payload.document_id).write_text(json.dumps(payload, indent=2))
+
+
+def ensure_upload_within_limit(file_bytes: bytes) -> None:
+    max_bytes = int(MAX_UPLOAD_MB * 1024 * 1024)
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {MAX_UPLOAD_MB:.1f} MB upload limit",
+        )
+
+
+@app.get("/health")
+async def healthcheck() -> dict[str, str]:
+    status = "ok"
+    if not AZURE_DOC_INTEL_ENDPOINT or not AZURE_DOC_INTEL_KEY or not OPENAI_API_KEY:
+        status = "degraded"
+    return {
+        "status": status,
+        "doc_intel_configured": str(bool(AZURE_DOC_INTEL_ENDPOINT and AZURE_DOC_INTEL_KEY)),
+        "openai_configured": str(bool(OPENAI_API_KEY)),
+        "database_configured": str(bool(DATABASE_URL)),
+    }
+
+
 @app.post("/upload-document")
 async def upload_document(file: UploadFile = File(...)) -> dict[str, str]:
     doc_id = str(uuid.uuid4())
+    file_bytes = await file.read()
+    ensure_upload_within_limit(file_bytes)
     file_path = UPLOAD_DIR / f"{doc_id}_{file.filename}"
     with file_path.open("wb") as f:
-        f.write(await file.read())
+        f.write(file_bytes)
+    logger.info("Uploaded document %s -> %s", doc_id, file.filename)
     return {"document_id": doc_id, "filename": file.filename}
 
 
 @app.post("/process-document", response_model=ProcessResult)
 async def process_document(payload: ProcessRequest) -> ProcessResult:
+    cached = read_cache(payload.document_id)
+    if cached and not payload.force:
+        logger.info("Returning cached result for %s", payload.document_id)
+        return cached
+
     matching_files = list(UPLOAD_DIR.glob(f"{payload.document_id}_*"))
     if not matching_files:
         raise HTTPException(status_code=404, detail="Document not found")
 
     doc_path = matching_files[0]
+    logger.info("Processing document %s", payload.document_id)
     doc_client = get_doc_client()
 
     with doc_path.open("rb") as f:
@@ -164,6 +278,7 @@ async def process_document(payload: ProcessRequest) -> ProcessResult:
     raw_json = response.output_text
     try:
         structured = InvoicePayload.model_validate_json(raw_json)
+        structured.reconcile_totals()
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -173,15 +288,17 @@ async def process_document(payload: ProcessRequest) -> ProcessResult:
         raw_ocr=ocr_payload,
     )
     CACHE[payload.document_id] = result_payload
+    write_cache(result_payload)
     return result_payload
 
 
 @app.post("/load-analytics")
 async def load_analytics(payload: LoadRequest) -> dict[str, str]:
-    if payload.document_id not in CACHE:
+    cached = read_cache(payload.document_id)
+    if not cached:
         raise HTTPException(status_code=404, detail="Document not processed")
 
-    data = CACHE[payload.document_id].invoice
+    data = cached.invoice
     engine = get_engine()
 
     with engine.begin() as connection:
@@ -300,3 +417,11 @@ async def load_analytics(payload: LoadRequest) -> dict[str, str]:
             )
 
     return {"status": "loaded", "document_id": payload.document_id}
+
+
+@app.get("/documents/{document_id}", response_model=ProcessResult)
+async def get_document(document_id: str) -> ProcessResult:
+    cached = read_cache(document_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Document not processed")
+    return cached
